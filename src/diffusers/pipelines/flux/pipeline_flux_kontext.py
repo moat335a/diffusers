@@ -756,6 +756,7 @@ class FluxKontextPipeline(
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         max_area: int = 1024**2,
+        concat_image_context: bool = False,
         _auto_resize: bool = True,
     ):
         r"""
@@ -858,6 +859,11 @@ class FluxKontextPipeline(
             max_area (`int`, defaults to `1024 ** 2`):
                 The maximum area of the generated image in pixels. The height and width will be adjusted to fit this
                 area while maintaining the aspect ratio.
+            concat_image_context (`bool`, *optional*, defaults to `False`):
+                When `image` is a list of images and this flag is `True`, each image is encoded via the VAE separately
+                and their packed latent token sequences are **concatenated along the sequence axis** to form a single
+                multi-reference context (not treated as a batch). When `False`, a list of images is treated as a batch
+                of independent inputs (backward compatible behavior).
 
         Examples:
 
@@ -915,6 +921,24 @@ class FluxKontextPipeline(
 
         device = self._execution_device
 
+        # If a list of images is provided and we're NOT concatenating contexts,
+        # treat it as a batch: replicate string prompts to match image batch size.
+        if (
+            image is not None
+            and isinstance(image, list)
+            and not concat_image_context
+        ):
+            img_batch = len(image)
+            if prompt is not None and isinstance(prompt, str):
+                prompt = [prompt] * img_batch
+            if prompt_2 is not None and isinstance(prompt_2, str):
+                prompt_2 = [prompt_2] * img_batch
+            if negative_prompt is not None and isinstance(negative_prompt, str):
+                negative_prompt = [negative_prompt] * img_batch
+            if negative_prompt_2 is not None and isinstance(negative_prompt_2, str):
+                negative_prompt_2 = [negative_prompt_2] * img_batch
+            batch_size = img_batch
+
         lora_scale = (
             self.joint_attention_kwargs.get("scale", None) if self.joint_attention_kwargs is not None else None
         )
@@ -953,35 +977,110 @@ class FluxKontextPipeline(
             )
 
         # 3. Preprocess image
+        multi_ref_concat = concat_image_context and isinstance(image, list)
         if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
-            img = image[0] if isinstance(image, list) else image
-            image_height, image_width = self.image_processor.get_default_height_width(img)
-            aspect_ratio = image_width / image_height
-            if _auto_resize:
-                # Kontext is trained on specific resolutions, using one of them is recommended
-                _, image_width, image_height = min(
-                    (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
-                )
-            image_width = image_width // multiple_of * multiple_of
-            image_height = image_height // multiple_of * multiple_of
-            image = self.image_processor.resize(image, image_height, image_width)
-            image = self.image_processor.preprocess(image, image_height, image_width)
+            if multi_ref_concat:
+                # Preprocess each reference independently to a valid Kontext resolution
+                processed_images = []
+                for img in image:
+                    ih, iw = self.image_processor.get_default_height_width(img)
+                    ar = iw / ih
+                    if _auto_resize:
+                        # Kontext is trained on specific resolutions; pick the closest
+                        _, iw, ih = min((abs(ar - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS)
+                    iw = iw // multiple_of * multiple_of
+                    ih = ih // multiple_of * multiple_of
+                    img_resized = self.image_processor.resize(img, ih, iw)
+                    img_tensor = self.image_processor.preprocess(img_resized, ih, iw)
+                    processed_images.append(img_tensor)
+                # keep as list of tensors for downstream multi-ref encoding
+                image = processed_images
+            else:
+                img = image[0] if isinstance(image, list) else image
+                image_height, image_width = self.image_processor.get_default_height_width(img)
+                aspect_ratio = image_width / image_height
+                if _auto_resize:
+                    # Kontext is trained on specific resolutions, using one of them is recommended
+                    _, image_width, image_height = min(
+                        (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
+                    )
+                image_width = image_width // multiple_of * multiple_of
+                image_height = image_height // multiple_of * multiple_of
+                image = self.image_processor.resize(image, image_height, image_width)
+                image = self.image_processor.preprocess(image, image_height, image_width)
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
-        latents, image_latents, latent_ids, image_ids = self.prepare_latents(
-            image,
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+        if multi_ref_concat and isinstance(image, list):
+            # Prepare noise latents first with no image conditioning
+            latents, _, latent_ids, _ = self.prepare_latents(
+                None,
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                latents,
+            )
+
+            # Encode each reference via VAE → pack → concat along sequence dim
+            all_image_latents = []
+            all_image_ids = []
+            effective_bs = batch_size * num_images_per_prompt
+            for img_t in image:  # each entry is a preprocessed tensor (B=1, 3, H, W)
+                img_t = img_t.to(device=device, dtype=prompt_embeds.dtype)
+                if img_t.shape[1] != self.latent_channels:
+                    img_latents = self._encode_vae_image(image=img_t, generator=generator)
+                else:
+                    img_latents = img_t
+
+                # Expand to match effective batch size if needed
+                if effective_bs > img_latents.shape[0] and effective_bs % img_latents.shape[0] == 0:
+                    reps = effective_bs // img_latents.shape[0]
+                    img_latents = torch.cat([img_latents] * reps, dim=0)
+                elif effective_bs > img_latents.shape[0] and effective_bs % img_latents.shape[0] != 0:
+                    raise ValueError(
+                        f"Cannot duplicate `image` of batch size {img_latents.shape[0]} to {effective_bs} text prompts."
+                    )
+                else:
+                    img_latents = torch.cat([img_latents], dim=0)
+
+                ih, iw = img_latents.shape[2:]
+                packed = self._pack_latents(img_latents, effective_bs, num_channels_latents, ih, iw)
+                ids = self._prepare_latent_image_ids(effective_bs, ih // 2, iw // 2, device, prompt_embeds.dtype)
+                # Mark these tokens as coming from image (channel 0 set to 1)
+                ids[..., 0] = 1
+                all_image_latents.append(packed)
+                all_image_ids.append(ids)
+
+            image_latents = torch.cat(all_image_latents, dim=1)  # sequence concat
+            image_ids = torch.cat(all_image_ids, dim=0)          # sequence concat
+        else:
+            latents, image_latents, latent_ids, image_ids = self.prepare_latents(
+                image,
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                latents,
+            )
+
         if image_ids is not None:
             latent_ids = torch.cat([latent_ids, image_ids], dim=0)  # dim 0 is sequence dimension
+
+        # Optional safety: warn if the combined sequence grows very large
+        total_seq_len = latents.shape[1] + (0 if image_latents is None else image_latents.shape[1])
+        max_seq = self.scheduler.config.get("max_image_seq_len", 4096)
+        if total_seq_len > max_seq:
+            logger.warning(
+                f"Total sequence length ({total_seq_len}) exceeds configured max ({max_seq}). "
+                "Consider reducing the number or resolution of reference images."
+            )
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas

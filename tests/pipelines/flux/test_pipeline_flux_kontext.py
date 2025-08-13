@@ -175,3 +175,78 @@ class FluxKontextPipelineFastTests(
         inputs["true_cfg_scale"] = 2.0
         true_cfg_out = pipe(**inputs, generator=torch.manual_seed(0)).images[0]
         assert not np.allclose(no_true_cfg_out, true_cfg_out)
+
+    def test_flux_multi_ref_concat_single_output(self):
+        pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)
+
+        # two small refs
+        img1 = PIL.Image.new("RGB", (32, 32), 0)
+        img2 = PIL.Image.new("RGB", (32, 32), 1)
+
+        if str(torch_device).startswith("mps"):
+            generator = torch.manual_seed(0)
+        else:
+            generator = torch.Generator(device="cpu").manual_seed(0)
+
+        height, width = 8, 8
+        inputs = {
+            "image": [img1, img2],
+            "concat_image_context": True,  # <-- new flag
+            "prompt": "A painting of a squirrel eating a burger",
+            "generator": generator,
+            "num_inference_steps": 2,
+            "guidance_scale": 5.0,
+            "height": height,
+            "width": width,
+            "max_area": height * width,
+            "max_sequence_length": 48,
+            "output_type": "np",
+            "_auto_resize": False,
+        }
+
+        out = pipe(**inputs).images  # np.ndarray expected: (B, H, W, C)
+
+        # concatenation mode should produce a single output sample
+        assert out.ndim == 4
+        assert out.shape[0] == 1
+
+        expected_height = height - height % (pipe.vae_scale_factor * 2)
+        expected_width = width - width % (pipe.vae_scale_factor * 2)
+        assert out.shape[1:3] == (expected_height, expected_width)
+
+    def test_flux_list_batch_without_concat(self):
+        pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)
+
+        img1 = PIL.Image.new("RGB", (32, 32), 0)
+        img2 = PIL.Image.new("RGB", (32, 32), 1)
+
+        if str(torch_device).startswith("mps"):
+            generator = torch.manual_seed(0)
+        else:
+            generator = torch.Generator(device="cpu").manual_seed(0)
+
+        height, width = 8, 8
+        inputs = {
+            "image": [img1, img2],  # list treated as batch by default
+            # concat_image_context omitted (defaults to False)
+            "prompt": "A painting of a squirrel eating a burger",
+            "generator": generator,
+            "num_inference_steps": 2,
+            "guidance_scale": 5.0,
+            "height": height,
+            "width": width,
+            "max_area": height * width,
+            "max_sequence_length": 48,
+            "output_type": "np",
+            "_auto_resize": False,
+        }
+
+        out = pipe(**inputs).images
+
+        # default behavior: batch of two outputs
+        assert out.ndim == 4
+        assert out.shape[0] == 2
+
+        expected_height = height - height % (pipe.vae_scale_factor * 2)
+        expected_width = width - width % (pipe.vae_scale_factor * 2)
+        assert out.shape[1:3] == (expected_height, expected_width)
