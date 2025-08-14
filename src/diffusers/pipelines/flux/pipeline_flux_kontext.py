@@ -1029,10 +1029,10 @@ class FluxKontextPipeline(
             all_image_latents = []
             all_image_ids = []
             effective_bs = batch_size * num_images_per_prompt
-            for img_t in image:  # each entry is a preprocessed tensor (B=1, 3, H, W)
+            for img_idx, img_t in enumerate(image):  # each entry is a preprocessed tensor (B=1, 3, H, W)
                 img_t = img_t.to(device=device, dtype=prompt_embeds.dtype)
                 if img_t.shape[1] != self.latent_channels:
-                    img_latents = self._encode_vae_image(image=img_t, generator=generator)
+                    img_latents = self._encode_vae_image(image=img_t, generator=generator) 
                 else:
                     img_latents = img_t
 
@@ -1051,7 +1051,7 @@ class FluxKontextPipeline(
                 packed = self._pack_latents(img_latents, effective_bs, num_channels_latents, ih, iw)
                 ids = self._prepare_latent_image_ids(effective_bs, ih // 2, iw // 2, device, prompt_embeds.dtype)
                 # Mark these tokens as coming from image (channel 0 set to 1)
-                ids[..., 0] = 1
+                ids[..., 0] = 1 if not concat_image_context else img_idx + 1
                 all_image_latents.append(packed)
                 all_image_ids.append(ids)
 
